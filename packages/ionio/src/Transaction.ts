@@ -20,7 +20,7 @@ import {
 import { Argument, encodeArgument } from './Argument';
 import { ArtifactFunction, Parameter } from './Artifact';
 import { H_POINT, LEAF_VERSION_TAPSCRIPT } from './constants';
-import { isSigner } from './Signer';
+import { isSigner, signInput } from './Signer';
 import { Introspect } from './Introspect';
 import { RequiredOutput, RequirementType, ScriptPubKey } from './Requirement';
 import { replaceTemplateWithConstructorArg } from './utils/template';
@@ -355,9 +355,15 @@ export class Transaction implements TransactionInterface {
         continue;
       }
 
-      const signedPtxBase64 = await arg.signTransaction(this.pset.toBase64());
-      const signedPtx = Pset.fromBase64(signedPtxBase64);
-      this.pset = signedPtx;
+      if (arg.signTransaction) {
+        const signedPtxBase64 = await arg.signTransaction(this.pset.toBase64());
+        const signedPtx = Pset.fromBase64(signedPtxBase64);
+        this.pset = signedPtx;
+      } else if (arg.signSchnorr) {
+        const pubKey = this.constructorArgs[0] as Buffer;
+        await signInput(this.pset, this.fundingUtxoIndex, arg, Buffer.of(0x00), this.network.genesisBlockHash);
+      }
+
 
       // add witness stack elements from function arguments
       const { tapKeySig, tapScriptSig } = this.pset.inputs[
