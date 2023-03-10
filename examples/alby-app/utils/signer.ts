@@ -5,7 +5,7 @@ import { Pset, Signer as PsetSigner, bip341, Transaction } from 'liquidjs-lib';
 const ECPair = ECPairFactory(ecc);
 
 
-export function ionioSigner(pubKey: Buffer, signSchnorr: (sigHash: Buffer) => Promise<Buffer>, genesisBlockHash: Buffer) {
+export function ionioSigner(pubKey: Buffer, signSchnorr: (sigHash: string) => Promise<string>, genesisBlockHash: Buffer) {
   return {
     signTransaction: async (base64: string): Promise<string> => {
       const pset = Pset.fromBase64(base64);
@@ -36,11 +36,8 @@ export function ionioSigner(pubKey: Buffer, signSchnorr: (sigHash: Buffer) => Pr
         const hashTypeBuffer =
           hashType !== 0x00 ? Buffer.of(hashType) : Buffer.alloc(0);
 
-        const signatureBuffer = await signSchnorr(sighashForSig);
-        /* Buffer.from(
-          ecc.signSchnorr(sighashForSig, keyPair.privateKey!, Buffer.alloc(32))
-        ); */
-
+        const signatureHex = await signSchnorr(sighashForSig.toString('hex'));
+        const signatureBuffer = Buffer.from(signatureHex, 'hex');
         const signatureWithHashType = Buffer.concat([
           signatureBuffer,
           hashTypeBuffer,

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import Head from 'next/head'
 import * as ecc from 'tiny-secp256k1';
 import secp256k1zkp from '@vulpemventures/secp256k1-zkp';
@@ -9,28 +9,24 @@ import { networks, Transaction, TxOutput } from 'liquidjs-lib';
 import artifact from '../transfer_with_key.json';
 import { ionioSigner } from '../utils/signer';
 import { WsElectrumChainSource } from '../utils/electrum';
+import QRCode from 'react-qr-code';
 
+import * as nostr from 'nostr-tools';
+import { Connect, ConnectURI } from '@nostr-connect/connect';
 
 const privateKeyHex = '826dd029c1e569e68e36543d182dd10475e50d33646a79a264a9837d8ccd32f5';
-const privateKey = noble.utils.hexToBytes(privateKeyHex);
-
 // window.alby.getPublicKey()
 const getPublicKey = () => {
+  const privateKey = noble.utils.hexToBytes(privateKeyHex);
   const xonlypub = noble.schnorr.getPublicKey(privateKey);
   return xonlypub;
 }
 // window.alby.signSchnorr()
 const signSchnorr = async (sigHash: Buffer): Promise<Buffer> => {
+  const privateKey = noble.utils.hexToBytes(privateKeyHex);
   const sig = await noble.schnorr.sign(sigHash, privateKey);
   return Buffer.from(sig.buffer);
 }
-
-const signer: Signer = ionioSigner(
-  Buffer.from(getPublicKey().buffer),
-  signSchnorr,
-  networks.testnet.genesisBlockHash
-)
-
 
 
 export default function Home() {
@@ -40,18 +36,28 @@ export default function Home() {
   const [txFundID, setFundTxID] = useState<string | null>(null);
   const [txSpendID, setSpendTxID] = useState<string | null>(null);
   const [contract, setContract] = useState<Contract | null>(null);
+  const [connected, setConnected] = useState(false);
+  const [remoteSigner, setRemoteSigner] = useState<string | null>(null);
+  const [connectURI, setConnectURI] = useState<string | null>(null);
+  const [connectInstance, setConnectInstance] = useState<Connect | null>(null);
 
+  const copyToClipboard = (value: string) => {
+    navigator.clipboard.writeText(value).then(undefined,
+      function (err) {
+        console.error('Async: Could not copy text: ', err);
+      });
+  }
 
   const compileContract = async () => {
+    if (!connectInstance) return;
 
-    const electrum = WsElectrumChainSource.fromNetwork(networks.testnet.name)
-
-    const pubkey = getPublicKey()
-    const pubkeyBuffer = Buffer.from(pubkey.buffer)
+    const pubkey = await connectInstance.getPublicKey();
+    const pubkeyBuffer = Buffer.from(pubkey, 'hex');
 
     const contract = new Contract(artifact as Artifact, [pubkeyBuffer], networks.testnet, { ecc, zkp: await secp256k1zkp() })
 
     // start watching for unspent output on the blockchain
+    const electrum = WsElectrumChainSource.fromNetwork(networks.testnet.name)
     electrum.subscribeScriptStatus(contract.scriptPubKey, async (status) => {
 
       const unspents = await electrum.fetchUnspentOutputs([contract.scriptPubKey])
@@ -81,8 +87,6 @@ export default function Home() {
 
 
   const burn = async () => {
-    const electrum = WsElectrumChainSource.fromNetwork(networks.testnet.name)
-
     if (!contract)
       throw new Error('Contract not compiled yet')
     if (!txFundID || isNaN(txFundVout as number) || !prevout)
@@ -92,6 +96,22 @@ export default function Home() {
     const instance = contract.from(txFundID, txFundVout as number, prevout)
 
     // create a transaction that burns the contract
+    const signer: Signer = ionioSigner(
+      Buffer.from(getPublicKey().buffer),
+      async (sigHash: string) => {
+        if (!connectInstance || !remoteSigner) return;
+        const signature = await connectInstance.rpc.call({
+          target: remoteSigner,
+          request: {
+            method: 'sign_schnorr',
+            params: [sigHash]
+          }
+        });
+        console.log(sigHash, signature);
+        return signature;
+      },
+      networks.testnet.genesisBlockHash
+    );    
     const tx = instance.functions.transfer(signer);
 
     // add the burn output where we burn all the coins minus 100 sats for the network fee
@@ -128,6 +148,60 @@ export default function Home() {
     }
   }
 
+  const createConnectionString = (secretKey: string) => {
+
+    const connectURI = new ConnectURI({
+      target: nostr.getPublicKey(secretKey),
+      relay: 'wss://nostr.vulpem.com',
+      metadata: {
+        name: 'Alby Website',
+        description: 'This is an example of how to use Alby to sign transactions with Ionio contracts.',
+        url: 'https://getalby.com',
+        icons: ['https://getalby.com/website/_assets/logo-WIC6GJUP.svg'],
+      },
+    });
+    return connectURI.toString();
+  }
+
+  useEffect(() => {
+    (async () => {
+      try {
+        let secretKey = localStorage.getItem('@alby-v0/secret');
+        const remoteSignerFromStore = localStorage.getItem('alby-v0/remote');
+        if (remoteSignerFromStore && secretKey) {
+          setConnected(true);
+          setRemoteSigner(remoteSignerFromStore)
+        } else {
+          secretKey = nostr.generatePrivateKey();
+          setConnected(false);
+          setRemoteSigner(null);
+          setConnectURI(createConnectionString(secretKey));
+        }
+        const connect = new Connect({ secretKey, relay: 'wss://nostr.vulpem.com' });
+        connect.events.on('connect', (pubkey: string) => {
+          setConnected(true);
+          setConnectURI(null);
+          setRemoteSigner(pubkey);
+          localStorage.setItem('alby-v0/remote', pubkey);
+          localStorage.setItem('@alby-v0/secret', secretKey!);
+        });
+        connect.events.on('disconnect', () => {
+          setConnected(false);
+          setRemoteSigner(null);
+          setConnectURI(createConnectionString(secretKey!));
+          localStorage.removeItem('alby-v0/remote');
+          localStorage.removeItem('@alby-v0/secret');
+        });
+        // initialize the connection with the wallet
+        await connect.init();
+        setConnectInstance(connect);
+      } catch (e) {
+        console.error(e);
+      }
+
+    })();
+  }, []);
+
 
   return (
     <>
@@ -149,6 +223,39 @@ export default function Home() {
       </section>
       <section className="section">
         <h1 className="title">Transfer with key</h1>
+
+        <div className="columns">
+          <div className="column is-6">
+            <div className="card">
+              <div className="card-content">
+                {
+                  !connected ? (
+                    <div className="content">
+                      <h3 className="title">Nostr Connnect</h3>
+                      <p className='subtitle'>📷 Scan with a Nostr Connect enabled app</p>
+                      <br />
+                      {connectURI && (
+                          <a onClick={() => copyToClipboard(connectURI)}>
+                            <QRCode
+                              size={256}
+                              value={connectURI}
+                              viewBox={`0 0 256 256`}
+                            />
+                          </a>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="content">
+                      <h3 className="title">Connected </h3>
+                      <p className='subtitle'>Remote signer 🖋 {remoteSigner?.substring(0, 8)}...{remoteSigner?.substring(remoteSigner.length - 8)}</p>
+                    </div>
+                  )
+                }
+              </div>
+            </div>
+          </div>
+        </div>
+
         <p className="subtitle">Simple taproot output with unspendable key-path and a CHECKSIG in a script-path </p>
         <p className='subtitle'>⚠️ Fund it with exactly <b>100k sats</b> </p>
         <div className="columns">
@@ -167,7 +274,7 @@ export default function Home() {
               <div className='card-footer'>
                 <div className='card-footer-item'>
                   <div className='buttons'>
-                    <button onClick={compileContract} className='button is-info'>Compile Contract</button>
+                    <button disabled={!connected} onClick={compileContract} className='button is-info'>Compile Contract</button>
                   </div>
                 </div>
               </div>
